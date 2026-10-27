@@ -1,17 +1,21 @@
 name: build-kebab-docker-kernel
 
-# 用法：仓库页面 → Actions → 左侧选 build-kebab-docker-kernel → Run workflow
+# 用法：Actions → build-kebab-docker-kernel → Run workflow
 on:
   workflow_dispatch:
     inputs:
-      branch:
-        description: 'OnePlusOSS 源码分支'
+      base_branch:
+        description: '官方源码分支（A14 / 4.19.157）'
         required: false
         default: 'oneplus/sm8250_u_14.0.0_op8t'
-      defconfig:
-        description: 'defconfig 路径'
+      fixup_branch:
+        description: '补齐源分支（含 sched_assist/tuning/uad）'
         required: false
-        default: 'vendor/kona-perf_defconfig'
+        default: 'bpf-5.15-backport'
+      toolchain:
+        description: '编译器：clang 或 gcc'
+        required: false
+        default: 'clang'
 
 jobs:
   build:
@@ -30,17 +34,53 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
-            python3 git rsync cpio kmod zip unzip device-tree-compiler \
+            python3 python-is-python3 git rsync cpio kmod zip unzip \
             gcc-aarch64-linux-gnu clang-12 lld-12
           clang-12 --version | head -1
 
-      - name: 拉取内核源码
+      - name: 拉取官方基线源码
         run: |
-          git clone --depth=1 -b "${{ inputs.branch }}" \
+          git clone --depth=1 -b "${{ inputs.base_branch }}" \
             https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git src
           cd src
           echo "== 版本 =="; grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
           grep -q 'SUBLEVEL = 157' Makefile || { echo "内核次版本不是 157，中止"; exit 1; }
+
+      - name: 补齐 OPLUS 缺失模块（sched_assist/tuning/uad）
+        run: |
+          git clone --depth=1 -b "${{ inputs.fixup_branch }}" \
+            https://github.com/toraidl/android_kernel_oneplus_sm8250.git fixup
+          MISS=0
+          for d in kernel/sched_assist kernel/tuning kernel/uad include/linux/sched_assist; do
+            if [ -d "fixup/$d" ]; then
+              rm -rf "src/$d"
+              cp -r "fixup/$d" "src/$d"
+              echo "已补齐 $d ($(find src/$d -type f | wc -l) 个文件)"
+            else
+              echo "!! fixup 仓库缺少 $d"; MISS=1
+            fi
+          done
+          [ "$MISS" = "0" ] || exit 1
+
+      - name: gcc-wrapper.py 兼容 Python3
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          p = 'scripts/gcc-wrapper.py'
+          s = open(p).read()
+          s = s.replace('print "error, forbidden warning:", m.group(2)',
+                        'print("error, forbidden warning:", m.group(2))')
+          s = s.replace('print line,', "print(line, end='')")
+          s = s.replace("print args[0] + ':',e.strerror",
+                        "print(args[0] + ':', e.strerror)")
+          s = s.replace("print 'Is your PATH set correctly?'",
+                        "print('Is your PATH set correctly?')")
+          s = s.replace("print ' '.join(args), str(e)",
+                        "print(' '.join(args), str(e))")
+          open(p, 'w').write(s)
+          import ast; ast.parse(s)
+          print('gcc-wrapper.py 已转 Python3，语法 OK')
+          PY
 
       - name: 写入 Docker 配置片段
         run: |
@@ -61,9 +101,13 @@ jobs:
         working-directory: src
         env:
           ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CC: clang-12
+          REAL_CC: clang-12
+          CLANG_TRIPLE: aarch64-linux-gnu-
         run: |
-          make O=out "${{ inputs.defconfig }}"
-          scripts/kconfig/merge_config.sh -O out out/.config ../docker.config
+          make O=out vendor/kona-perf_defconfig
+          cat ../docker.config >> out/.config
           make O=out olddefconfig
           echo "===== 关键项核对 ====="
           for k in CONFIG_PID_NS CONFIG_CGROUP_DEVICE CONFIG_BRIDGE_NETFILTER \
@@ -84,10 +128,11 @@ jobs:
           SUBARCH: arm64
           CROSS_COMPILE: aarch64-linux-gnu-
           CC: clang-12
+          REAL_CC: clang-12
           CLANG_TRIPLE: aarch64-linux-gnu-
           KCFLAGS: -Wno-error -Wno-unused-command-line-argument
         run: |
-          make O=out -j"$(nproc)" Image 2>&1 | tail -60
+          make O=out -j"$(nproc)" Image
           ls -la out/arch/arm64/boot/Image
 
       - name: 校验产物
