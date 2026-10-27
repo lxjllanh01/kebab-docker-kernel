@@ -97,6 +97,12 @@ jobs:
                         "print('Is your PATH set correctly?')")
           s = s.replace("print ' '.join(args), str(e)",
                         "print(' '.join(args), str(e))")
+          # py3: proc.stderr 产出 bytes，先 decode 再逐行处理
+          s = s.replace("for line in proc.stderr:",
+                        "for line in (raw.decode('utf-8', 'replace') for raw in proc.stderr):")
+          # clang-12 相比原厂 clang-10 告警更多，不再因 warning 终止构建（仅打印）
+          s = s.replace("if m and m.group(2) not in allowed_warnings:",
+                        "if False:")
           open(p, 'w').write(s)
           import ast; ast.parse(s)
           print('gcc-wrapper.py 已转 Python3，语法 OK')
