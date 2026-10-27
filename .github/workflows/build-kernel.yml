@@ -198,9 +198,15 @@ jobs:
           print(f'sde_fence.h 修复 {n} 处')
           assert n == 1, 'sde_fence.h 预期恰好 1 处'
           PY
+          # 3) oplus_display_panel.h 的 C++ 风格枚举（enum X : int 是 C++ 语法，C 非法）；
+          #    值域 4096~18432，去掉 underlying type 对 C 枚举无影响。
+          #    已扫描确认 display 内仅此一处（其余命中均在注释里）
+          sed -i 's/^enum APOLLO_BL_ID : int {/enum APOLLO_BL_ID {/' \
+            techpack/display/oplus/oplus_display_panel.h
           echo "===== 校验 ====="
           grep -n "bool oplus_adfr_is_support" techpack/display/oplus/oplus_adfr.h techpack/display/oplus/oplus_adfr.c
           grep -n -A2 "static inline void sde_fence_timeline_status" techpack/display/msm/sde/sde_fence.h
+          grep -n "enum APOLLO_BL_ID" techpack/display/oplus/oplus_display_panel.h
 
       - name: gcc-wrapper.py 兼容 Python3
         working-directory: src
