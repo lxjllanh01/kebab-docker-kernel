@@ -1,0 +1,111 @@
+name: build-kebab-docker-kernel
+
+# 用法：仓库页面 → Actions → 左侧选 build-kebab-docker-kernel → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'OnePlusOSS 源码分支'
+        required: false
+        default: 'oneplus/sm8250_u_14.0.0_op8t'
+      defconfig:
+        description: 'defconfig 路径'
+        required: false
+        default: 'vendor/kona-perf_defconfig'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: 腾出磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 git rsync cpio kmod zip unzip device-tree-compiler \
+            gcc-aarch64-linux-gnu clang-12 lld-12
+          clang-12 --version | head -1
+
+      - name: 拉取内核源码
+        run: |
+          git clone --depth=1 -b "${{ inputs.branch }}" \
+            https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git src
+          cd src
+          echo "== 版本 =="; grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
+          grep -q 'SUBLEVEL = 157' Makefile || { echo "内核次版本不是 157，中止"; exit 1; }
+
+      - name: 写入 Docker 配置片段
+        run: |
+          cat > docker.config <<'EOF'
+          # 致命项
+          CONFIG_PID_NS=y
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_BRIDGE_NETFILTER=y
+          # 必要项
+          CONFIG_CGROUP_PIDS=y
+          CONFIG_IPC_NS=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          EOF
+          echo "--- 片段内容 ---"; cat docker.config
+
+      - name: 生成配置
+        working-directory: src
+        env:
+          ARCH: arm64
+        run: |
+          make O=out "${{ inputs.defconfig }}"
+          scripts/kconfig/merge_config.sh -O out out/.config ../docker.config
+          make O=out olddefconfig
+          echo "===== 关键项核对 ====="
+          for k in CONFIG_PID_NS CONFIG_CGROUP_DEVICE CONFIG_BRIDGE_NETFILTER \
+                   CONFIG_CGROUP_PIDS CONFIG_IPC_NS CONFIG_POSIX_MQUEUE \
+                   CONFIG_OVERLAY_FS CONFIG_VETH CONFIG_MEMCG \
+                   CONFIG_MODVERSIONS CONFIG_MODULE_SIG_FORCE; do
+            printf '%-32s %s\n' "$k" "$(grep -E "^$k=" out/.config || echo '未开启')"
+          done
+          grep -q '^CONFIG_PID_NS=y' out/.config || { echo "!! PID_NS 未打开"; exit 1; }
+          grep -q '^CONFIG_MODULE_SIG_FORCE=y' out/.config || { echo "!! 模块签名校验被关，异常"; exit 1; }
+          grep -q '^CONFIG_LOCALVERSION="-perf"' out/.config || { echo "!! LOCALVERSION 不是 -perf"; exit 1; }
+          printf '%-32s %s\n' "CONFIG_LOCALVERSION" "$(grep '^CONFIG_LOCALVERSION=' out/.config)"
+
+      - name: 编译内核
+        working-directory: src
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CC: clang-12
+          CLANG_TRIPLE: aarch64-linux-gnu-
+          KCFLAGS: -Wno-error -Wno-unused-command-line-argument
+        run: |
+          make O=out -j"$(nproc)" Image 2>&1 | tail -60
+          ls -la out/arch/arm64/boot/Image
+
+      - name: 校验产物
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          d = open('out/arch/arm64/boot/Image','rb').read()
+          assert d[0x38:0x3c] == b'ARM\x64', '不是合法 arm64 Image'
+          print(f'arm64 Image 校验通过，大小 {len(d)} 字节')
+          PY
+          cp out/.config ../kernel.config
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kebab-kernel-image
+          path: |
+            src/out/arch/arm64/boot/Image
+            kernel.config
+          if-no-files-found: error
+          retention-days: 14
