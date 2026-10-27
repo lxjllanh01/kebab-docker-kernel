@@ -62,6 +62,21 @@ jobs:
           done
           [ "$MISS" = "0" ] || exit 1
 
+      - name: 适配 4.19.157 API（cgroup_id → cgroup_ino）
+        working-directory: src
+        run: |
+          # toraidl 补齐文件基于 4.19.325，使用 cgroup_id()；4.19.157 基线只有 cgroup_ino()，
+          # 两者语义一致（返回 cgroup 的 inode 标识），直接替换
+          FILES=$(grep -rl 'cgroup_id(' kernel/sched_assist kernel/tuning kernel/uad include/linux/sched_assist 2>/dev/null || true)
+          if [ -n "$FILES" ]; then
+            echo "$FILES" | xargs sed -i 's/\bcgroup_id(/cgroup_ino(/g'
+            echo "已替换 cgroup_id → cgroup_ino:"
+            echo "$FILES"
+          else
+            echo "无需替换"
+          fi
+          grep -rn '\bcgroup_id(' kernel/sched_assist kernel/tuning kernel/uad include/linux/sched_assist && { echo "!! 仍有残留"; exit 1; } || true
+
       - name: 修复悬空符号链接（vendor 内部链接）
         working-directory: src
         run: |
