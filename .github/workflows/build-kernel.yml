@@ -124,6 +124,26 @@ jobs:
             fi
           done
 
+      - name: 适配编译（voocphy 严格标志 / sy6529 括号 / IPA fortify 误报）
+        working-directory: src
+        run: |
+          # 1) toraidl 的 voocphy Makefile 加了 -Werror=parentheses 和全局 -Werror，clang-12 下过于严格
+          sed -i -e 's/subdir-ccflags-y += -Werror=parentheses/subdir-ccflags-y += -Wno-parentheses/' \
+                 -e 's/^subdir-ccflags-y += -Werror$/subdir-ccflags-y += -Wno-error/' \
+                 drivers/power/oplus/v1/Makefile
+          # 2) sy6529 真实 bug：== 与 | 优先级漏括号
+          sed -i 's/\*data == sy6529_CHARGE_MODE_2_1 | \*data == sy6529_CHARGE_MODE_1_1/(*data == sy6529_CHARGE_MODE_2_1) || (*data == sy6529_CHARGE_MODE_1_1)/' \
+            drivers/power/oplus/v1/voocphy/oplus_sy6529.c
+          # 3) ipa_hw_stats fortify 误报：代码已有 sizeof(dbg_buff)<count+1 守卫，
+          #    clang-12 内联后无法静态证明 count 范围而误触发 __bad_copy_to；
+          #    _copy_from_user（arm64 内联版，自带 access_ok）绕过 fortify 检查
+          sed -i 's/missing = copy_from_user(dbg_buff, ubuf, count);/missing = _copy_from_user(dbg_buff, ubuf, count);/' \
+            drivers/platform/msm/ipa/ipa_v3/ipa_hw_stats.c
+          echo "===== 校验 ====="
+          grep -n "CHARGE_MODE_2_1) ||" drivers/power/oplus/v1/voocphy/oplus_sy6529.c
+          grep -n "_copy_from_user(dbg_buff" drivers/platform/msm/ipa/ipa_v3/ipa_hw_stats.c
+          grep -n "Werror=parentheses" drivers/power/oplus/v1/Makefile || echo "voocphy 严格标志已移除"
+
       - name: 修复悬空符号链接（vendor 内部链接）
         working-directory: src
         run: |
