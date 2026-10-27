@@ -165,6 +165,19 @@ jobs:
           grep -n "_copy_from_user(dbg_buff" drivers/platform/msm/ipa/ipa_v3/ipa_hw_stats.c
           grep -n "Werror=parentheses" drivers/power/oplus/v1/Makefile || echo "voocphy 严格标志已移除"
 
+      - name: 适配编译（C99 inline 语义修正）
+        working-directory: src
+        run: |
+          # clang-12 严格按 C99 处理 inline：头文件 `inline int f();` 声明 + 跨 TU 调用
+          # 报 "always_inline function body not available"；dma-buf.c 的 `inline int f(){}`
+          # 定义在 C99 下也不导出外部符号。统一改为普通外部函数（与 gnu89 语义等价）。
+          sed -i 's/^inline int oplus_is_dma_buf_file/int oplus_is_dma_buf_file/' \
+            include/soc/oplus/lowmem_dbg.h \
+            drivers/soc/oplus/lowmem_dbg/lowmem_dbg.h \
+            drivers/dma-buf/dma-buf.c
+          echo "===== 校验 ====="
+          grep -n "int oplus_is_dma_buf_file" include/soc/oplus/lowmem_dbg.h drivers/dma-buf/dma-buf.c
+
       - name: gcc-wrapper.py 兼容 Python3
         working-directory: src
         run: |
