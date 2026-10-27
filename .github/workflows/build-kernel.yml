@@ -234,6 +234,31 @@ jobs:
           print('gcc-wrapper.py 已转 Python3，语法 OK')
           PY
 
+      - name: 适配链接期（gsi CRC 生成失败 / selinux rtic 段溢出）
+        working-directory: src
+        run: |
+          # v14 到达最终链接后暴露两个问题：
+          # 1) genksyms 解析器不认识 `union __packed 类型名` 引用（属性位置在 union 之后），
+          #    gsi_write_channel_scratch 的 CRC 生成失败 → __crc_ 符号未定义 →
+          #    PIE 链接时 R_AARCH64_ABS32 报错。
+          #    修法与 LineageOS commit 02246d1（Nick Desaulniers）一致：
+          #    去掉所有"引用处"的 __packed（定义处必须保留，packed 影响类型布局/ABI）。
+          #    注意：msm_gsi.h 中 union 定义行（后跟 {）不能改，只改原型行。
+          # 2) selinux_state 带 __rticdata（section ".bss.rtic"），新 binutils 对该
+          #    尾部孤儿段布局产生 ADR_PREL_PG_HI21 重定位溢出（小米 lavender 同款问题）。
+          #    全仓库仅 hooks.c 使用 __rticdata，去掉属性改回普通 .bss 变量，
+          #    仅影响 Qualcomm RTIC 调试功能，无功能影响。
+          sed -i 's/union __packed gsi_channel_scratch/union gsi_channel_scratch/g' \
+            drivers/platform/msm/gsi/gsi.c
+          sed -i '/union __packed gsi_channel_scratch {/!s/union __packed gsi_channel_scratch/union gsi_channel_scratch/g' \
+            include/linux/msm_gsi.h
+          sed -i 's/^struct selinux_state selinux_state __rticdata;/struct selinux_state selinux_state;/' \
+            security/selinux/hooks.c
+          echo "===== 校验 ====="
+          grep -c "union __packed gsi_channel_scratch" drivers/platform/msm/gsi/gsi.c include/linux/msm_gsi.h || true
+          grep -n "union __packed gsi_channel_scratch {" include/linux/msm_gsi.h
+          grep -n "^struct selinux_state selinux_state" security/selinux/hooks.c
+
       - name: 写入 Docker 配置片段
         run: |
           cat > docker.config <<'EOF'
