@@ -77,6 +77,37 @@ jobs:
           fi
           grep -rn '\bcgroup_id(' kernel/sched_assist kernel/tuning kernel/uad include/linux/sched_assist && { echo "!! 仍有残留"; exit 1; } || true
 
+      - name: 适配 4.19.157 API（stack_trace_save 兼容 shim）
+        working-directory: src
+        run: |
+          # toraidl 4.19.325 的 kern_lock_stat.c 用 5.x 的 stack_trace_save()；
+          # 4.19.157 基线只有旧式 save_stack_trace() + struct stack_trace（CONFIG_STACKTRACE=y 已确认）
+          cat > include/linux/stack_trace_compat.h <<'EOF'
+          /* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _STACK_TRACE_COMPAT_H
+          #define _STACK_TRACE_COMPAT_H
+          /* 5.x stack_trace_save() 的 4.19 兼容实现 */
+          #include <linux/stacktrace.h>
+          static inline unsigned int stack_trace_save(unsigned long *store,
+            unsigned int nr_entries, unsigned int skipnr)
+          {
+            struct stack_trace trace = {
+              .entries = store,
+              .max_entries = nr_entries,
+              .skip = skipnr,
+            };
+            save_stack_trace(&trace);
+            return trace.nr_entries;
+          }
+          #endif
+          EOF
+          for f in kernel/sched_assist/sync/kern_lock_stat.c include/linux/sched_assist/sync/kern_lock_stat.c; do
+            if [ -f "$f" ] && ! grep -q stack_trace_compat "$f"; then
+              sed -i 's|#include "locking_main.h"|#include "locking_main.h"\n#include <linux/stack_trace_compat.h>|' "$f"
+              echo "已注入 compat shim: $f"
+            fi
+          done
+
       - name: 修复悬空符号链接（vendor 内部链接）
         working-directory: src
         run: |
