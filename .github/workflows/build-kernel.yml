@@ -178,6 +178,30 @@ jobs:
           echo "===== 校验 ====="
           grep -n "int oplus_is_dma_buf_file" include/soc/oplus/lowmem_dbg.h drivers/dma-buf/dma-buf.c
 
+      - name: 适配编译（display techpack C99 inline / sde_fence 语法）
+        working-directory: src
+        run: |
+          # 1) oplus_adfr：头文件 `inline bool f(void);` 声明 + .c `inline bool f(void){}` 定义，
+          #    跨 TU 调用（sde_crtc.c），clang-12 严格 C99 报 always_inline body not available；
+          #    与 v10 的 lowmem_dbg 同类问题，去 inline 改普通外部函数
+          sed -i 's/^inline bool oplus_adfr_is_support/bool oplus_adfr_is_support/' \
+            techpack/display/oplus/oplus_adfr.h \
+            techpack/display/oplus/oplus_adfr.c
+          # 2) sde_fence.h stub 分支（CONFIG_SW_SYNC=n 时编译）：函数原型结尾多了分号，
+          #    `...drm_obj);\n{` 是非法 C（文件级孤立语句块）——已全量扫描确认 display 内仅此一处
+          python3 - <<'PY'
+          p = 'techpack/display/msm/sde/sde_fence.h'
+          s = open(p).read()
+          n = s.count('drm_obj);\n{')
+          s = s.replace('drm_obj);\n{', 'drm_obj)\n{')
+          open(p, 'w').write(s)
+          print(f'sde_fence.h 修复 {n} 处')
+          assert n == 1, 'sde_fence.h 预期恰好 1 处'
+          PY
+          echo "===== 校验 ====="
+          grep -n "bool oplus_adfr_is_support" techpack/display/oplus/oplus_adfr.h techpack/display/oplus/oplus_adfr.c
+          grep -n -A2 "static inline void sde_fence_timeline_status" techpack/display/msm/sde/sde_fence.h
+
       - name: gcc-wrapper.py 兼容 Python3
         working-directory: src
         run: |
