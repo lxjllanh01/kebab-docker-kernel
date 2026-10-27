@@ -62,6 +62,26 @@ jobs:
           done
           [ "$MISS" = "0" ] || exit 1
 
+      - name: 修复悬空符号链接（vendor 内部链接）
+        working-directory: src
+        run: |
+          FIXED=0; STUB=0
+          while IFS= read -r l; do
+            p="${l#./}"
+            if [ -e "../fixup/$p" ] && [ ! -L "../fixup/$p" ]; then
+              rm -f "$l"; mkdir -p "$(dirname "$l")"
+              cp -r "../fixup/$p" "$l"
+              FIXED=$((FIXED+1))
+            else
+              echo "!! 无补齐来源，空文件占位: $p"
+              rm -f "$l"; mkdir -p "$(dirname "$l")"; touch "$l"
+              STUB=$((STUB+1))
+            fi
+          done < <(find . -xtype l)
+          echo "===== 悬空链接修复统计 ====="
+          echo "从补齐分支修复: $FIXED 个"
+          echo "空文件占位:     $STUB 个"
+
       - name: gcc-wrapper.py 兼容 Python3
         working-directory: src
         run: |
