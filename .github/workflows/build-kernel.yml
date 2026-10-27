@@ -257,8 +257,21 @@ jobs:
           CC: clang-12
           REAL_CC: clang-12
           CLANG_TRIPLE: aarch64-linux-gnu-
+          # OPLUS 特性 make 变量：oplus_native_features.mk 只在顶层 make 生效，
+          # 子 make（drivers/scsi/ufs、net/oplus_router_boost、mm/task_mem、techpack/display）
+          # 的 ifeq 门控全部看不到 → 对应 .o 不编译 → vmlinux 链接 undefined reference。
+          # 原厂构建是命令行传参（自动传播到子 make），这里保持一致。
+          # 注意：不传 OPLUS_FEATURE_PXLW_IRIS5（8T 无 Pixelworks 芯片，且 iris 代码有 C99 inline 问题）
+          FEATURE_VARS: >-
+            OPLUS_FEATURE_MEMLEAK_DETECT=yes
+            OPLUS_FEATURE_PROCESS_RECLAIM=yes
+            OPLUS_FEATURE_ADFR_KERNEL=yes
+            OPLUS_FEATURE_UFS_SHOW_LATENCY=yes
+            OPLUS_FEATURE_UFSPLUS=yes
+            OPLUS_FEATURE_PADL_STATISTICS=yes
+            OPLUS_FEATURE_WIFI_ROUTERBOOST=yes
         run: |
-          make O=out vendor/kona-perf_defconfig
+          make O=out $FEATURE_VARS vendor/kona-perf_defconfig
           cat ../docker.config >> out/.config
           make O=out olddefconfig
           echo "===== 关键项核对 ====="
@@ -283,8 +296,16 @@ jobs:
           REAL_CC: clang-12
           CLANG_TRIPLE: aarch64-linux-gnu-
           KCFLAGS: -Wno-error -Wno-unused-command-line-argument
+          FEATURE_VARS: >-
+            OPLUS_FEATURE_MEMLEAK_DETECT=yes
+            OPLUS_FEATURE_PROCESS_RECLAIM=yes
+            OPLUS_FEATURE_ADFR_KERNEL=yes
+            OPLUS_FEATURE_UFS_SHOW_LATENCY=yes
+            OPLUS_FEATURE_UFSPLUS=yes
+            OPLUS_FEATURE_PADL_STATISTICS=yes
+            OPLUS_FEATURE_WIFI_ROUTERBOOST=yes
         run: |
-          make O=out -j"$(nproc)" Image
+          make O=out $FEATURE_VARS -j"$(nproc)" Image
           ls -la out/arch/arm64/boot/Image
 
       - name: 校验产物
