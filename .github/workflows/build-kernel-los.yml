@@ -178,6 +178,7 @@ jobs:
           assert not diff, f'内核区外被改动 {diff[:5]}'
           open('artifacts/boot-kebab-los-docker.img','wb').write(bytes(out))
           print('已生成 boot-kebab-los-docker.img', len(out), '字节, id', h.hexdigest()[:16])
+          PY
           cp kernel/out/arch/arm64/boot/Image artifacts/Image
           cp kernel/out/.config artifacts/kernel.config
           cp kernel/out/Module.symvers artifacts/Module.symvers || true
