@@ -1,0 +1,208 @@
+name: build-kebab-docker-kernel-v3
+
+# v21/v22 策略：基座仍是 toraidl 完整树（4.19.325 + 全套 oplus 驱动）。
+# v20 只差一个符号：vl53L1（激光对焦）引用相机 CCI 的 cam_cci_control_interface，
+# 而原厂配置里 CONFIG_SPECTRA_CAMERA is not set → 相机代码不进 vmlinux → 链接失败。
+# 本工作流给出两条路线，用 enable_camera 区分：
+#   false：给 vl53L1 补一个 cam_cci_control_interface 桩（相机不内置，先保证能开机）
+#   true ：打开 CONFIG_SPECTRA_CAMERA（相机内置，与原厂 kernel.bin 的实际内容一致）
+on:
+  workflow_dispatch:
+    inputs:
+      base_repo:
+        description: '基座仓库'
+        required: false
+        default: 'toraidl/android_kernel_oneplus_sm8250'
+      base_branch:
+        description: '基座分支'
+        required: false
+        default: 'bpf-5.15-backport'
+      use_stock_config:
+        description: '用设备出厂配置作基线（true/false）'
+        required: false
+        default: 'true'
+      enable_camera:
+        description: '内置相机 Spectra（true=开，false=打桩跳过）'
+        required: false
+        default: 'false'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾出磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc bison flex libssl-dev \
+            libelf-dev kmod cpio rsync python3 gcc-aarch64-linux-gnu \
+            clang-12 lld-12 llvm-12
+          clang-12 --version | head -1
+          ld.lld-12 --version | head -1
+
+      - name: 拉取基座源码
+        run: |
+          git clone --depth=1 -b "${{ inputs.base_branch }}" \
+            "https://github.com/${{ inputs.base_repo }}.git" src
+          cd src
+          echo "== 版本 =="; grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
+          echo "== 关键目录 =="
+          for d in drivers/soc/oplus kernel/sched_assist techpack/display \
+                   techpack/camera kernel/tuning kernel/uad; do
+            printf '  %-24s %s 个文件\n' "$d" "$(find $d -type f 2>/dev/null | wc -l)"
+          done
+          echo "== 悬空符号链接 =="; find . -xtype l | wc -l
+
+      - name: 放宽模块符号版本校验（vendor .ko 可加载）
+        working-directory: src
+        run: |
+          # vendor 分区的 .ko 由一加私钥签名、CRC 按 4.19.157 记录；本树为 4.19.325，
+          # 关掉强制签名（见 docker.config 的 CONFIG_MODULE_SIG_FORCE=n）后还需放过
+          # CRC 不一致的情况，否则模块会以 "disagrees about version of symbol" 被拒。
+          python3 - <<'PY'
+          p = 'kernel/module.c'
+          s = open(p).read()
+          assert 'CRC bypass' not in s, '已打过补丁'
+          i = s.index('bad_version:')
+          j = s.index('return 0;', i)
+          s = s[:j] + 'return 1; /* CRC bypass */' + s[j + len('return 0;'):]
+          open(p, 'w').write(s)
+          print('check_version bad_version 已改为放行')
+          PY
+          grep -n -A4 "^bad_version:" kernel/module.c
+
+      - name: 处理相机 CCI 依赖（vl53L1 引用 cam_cci_control_interface）
+        working-directory: src
+        run: |
+          if [ "${{ inputs.enable_camera }}" = "true" ]; then
+            echo "== 路线A：内置 Spectra 相机，符号由 cam_cci_core.c 提供 =="
+            grep -n "SPECTRA_CAMERA" drivers/media/platform/msm/Kconfig | head -3
+          else
+            echo "== 路线B：给 vl53L1 补桩 =="
+            D=drivers/input/misc/vl53L1/kona
+            cat > "$D/cam_cci_stub.c" <<'EOF'
+          /* vl53L1 的相机 CCI 接口桩：
+           * 本内核未内置 Spectra 相机（CONFIG_SPECTRA_CAMERA=n），
+           * 而 vl53L1 通过 cam_cci_ctrl_interface.h 无条件启用了 USE_CAMERA_CCI，
+           * 导致 vmlinux 链接缺符号。这里给一个空实现，让激光对焦走自己的
+           * i2c/pinctrl 复位路径。
+           */
+          #include <linux/kernel.h>
+          #include <linux/types.h>
+
+          int32_t cam_cci_control_interface(void *cci)
+          {
+          	pr_debug("vl53l1: cam_cci stub called (%d)\n",
+          		 cci ? *(int *)cci : -1);
+          	return 0;
+          }
+          EOF
+            if ! grep -q "cam_cci_stub" "$D/Kbuild"; then
+              echo 'stmvl53l1-objs		+= cam_cci_stub.o' >> "$D/Kbuild"
+            fi
+            tail -3 "$D/Kbuild"
+          fi
+
+      - name: 写入配置片段
+        run: |
+          cat > docker.config <<'EOF'
+          # Docker 必需
+          CONFIG_PID_NS=y
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_BRIDGE_NETFILTER=y
+          CONFIG_CGROUP_PIDS=y
+          CONFIG_IPC_NS=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          # vendor 模块加载（一加私钥签名，本构建无法复现）
+          CONFIG_MODULE_SIG_FORCE=n
+          EOF
+          if [ "${{ inputs.enable_camera }}" = "true" ]; then
+            echo "CONFIG_SPECTRA_CAMERA=y" >> docker.config
+          fi
+          echo "--- 片段内容 ---"; cat docker.config
+
+      - name: 生成配置
+        working-directory: src
+        env:
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+        run: |
+          MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- \
+            LD=ld.lld-12 AR=llvm-ar-12 NM=llvm-nm-12 OBJCOPY=llvm-objcopy-12 \
+            OBJDUMP=llvm-objdump-12 STRIP=llvm-strip-12 READELF=llvm-readelf-12"
+          echo "MAKECC=$MAKECC"
+          mkdir -p out
+          if [ "${{ inputs.use_stock_config }}" = "true" ] && [ -f "$GITHUB_WORKSPACE/stock.config" ]; then
+            echo "== 用设备出厂配置作基线 =="
+            cp "$GITHUB_WORKSPACE/stock.config" out/.config
+          else
+            echo "== 用基座自带的 kona-perf_defconfig =="
+            make O=out $MAKECC vendor/kona-perf_defconfig
+          fi
+          cat "$GITHUB_WORKSPACE/docker.config" >> out/.config
+          make O=out $MAKECC olddefconfig
+          echo "===== 关键项 ====="
+          for k in CONFIG_PID_NS CONFIG_CGROUP_DEVICE CONFIG_BRIDGE_NETFILTER \
+                   CONFIG_CGROUP_PIDS CONFIG_IPC_NS CONFIG_POSIX_MQUEUE \
+                   CONFIG_OVERLAY_FS CONFIG_VETH CONFIG_MEMCG CONFIG_MODVERSIONS \
+                   CONFIG_MODULE_SIG_FORCE CONFIG_LOCALVERSION CONFIG_PREEMPT CONFIG_SMP \
+                   CONFIG_SPECTRA_CAMERA CONFIG_STMVL53L1; do
+            printf '%-34s %s\n' "$k" "$(grep -E "^$k=|^# $k is not set" out/.config | head -1)"
+          done
+          grep -q '^CONFIG_PID_NS=y' out/.config || { echo "!! PID_NS 未打开"; exit 1; }
+          grep -q '^CONFIG_CGROUP_DEVICE=y' out/.config || { echo "!! CGROUP_DEVICE 未打开"; exit 1; }
+          grep -q '^CONFIG_BRIDGE_NETFILTER=y' out/.config || { echo "!! BRIDGE_NETFILTER 未打开"; exit 1; }
+          grep -qE '^(# CONFIG_MODULE_SIG_FORCE is not set|CONFIG_MODULE_SIG_FORCE=n)' out/.config \
+            || { echo "!! 模块强制签名未关闭"; exit 1; }
+          if [ "${{ inputs.enable_camera }}" = "true" ]; then
+            grep -q '^CONFIG_SPECTRA_CAMERA=y' out/.config || { echo "!! 相机未打开"; exit 1; }
+          fi
+
+      - name: 编译内核
+        working-directory: src
+        env:
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+        run: |
+          MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- \
+            LD=ld.lld-12 AR=llvm-ar-12 NM=llvm-nm-12 OBJCOPY=llvm-objcopy-12 \
+            OBJDUMP=llvm-objdump-12 STRIP=llvm-strip-12 READELF=llvm-readelf-12"
+          make O=out $MAKECC -j"$(nproc)" Image
+          ls -la out/arch/arm64/boot/Image
+
+      - name: 校验产物
+        working-directory: src
+        run: |
+          cp out/.config "$GITHUB_WORKSPACE/kernel.config"
+          python3 - <<'PY'
+          import struct
+          p = 'out/arch/arm64/boot/Image'
+          d = open(p, 'rb').read()
+          print('大小', len(d), 'magic', d[0x38:0x3c])
+          assert d[0x38:0x3c] == b'ARMd', '不是合法的 arm64 Image'
+          text_off, image_size, flags = struct.unpack('<QQQ', d[8:0x20])
+          print(f'text_offset=0x{text_off:x} image_size={image_size} flags=0x{flags:x}')
+          i = d.find(b'Linux version')
+          print('版本串:', d[i:i+180].split(b'\x00')[0].decode('utf-8', 'replace'))
+          print('原厂 kernel_size=47810064，本镜像', '可原地替换' if len(d) <= 47810064 else '超出 %d 字节' % (len(d)-47810064))
+          PY
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kebab-kernel-v3
+          path: |
+            src/out/arch/arm64/boot/Image
+            src/out/Module.symvers
+            kernel.config
+          if-no-files-found: error
+          retention-days: 14
