@@ -27,7 +27,7 @@ jobs:
       matrix:
         # clang12：贴近原厂工具链（原厂 = clang 10.0.7 + GNU ld 2.27）
         # gcc11  ：已验证可以完整编译通过的路径，作为对照/回退
-        toolchain: [clang12lld, gcc11]
+        toolchain: [clang12lld]
 
     steps:
       - uses: actions/checkout@v4
@@ -270,6 +270,26 @@ jobs:
           grep -n "union __packed gsi_channel_scratch {" include/linux/msm_gsi.h
           grep -n "^struct selinux_state selinux_state" security/selinux/hooks.c
 
+      - name: 放宽模块符号版本校验（vendor .ko 可加载）
+        working-directory: src
+        run: |
+          # vendor 分区的 .ko 是按原厂内核编译的；本树混入了补齐模块，个别符号 CRC
+          # 可能与原厂不同。check_version() 的 bad_version 分支一旦命中就整模块拒绝加载，
+          # 这里改为只告警不拒绝。配合 CONFIG_MODULE_SIG_FORCE=n，让原厂 .ko 全部可加载。
+          # 注意：不能关 CONFIG_MODVERSIONS（否则 vermagic 少了 modversions 字段，
+          # 原厂 .ko 反而因 vermagic 不匹配被拒）。
+          python3 - <<'PY'
+          p = 'kernel/module.c'
+          s = open(p).read()
+          assert 'v19 CRC' not in s, '已打过补丁'
+          i = s.index('bad_version:')
+          j = s.index('return 0;', i)
+          s = s[:j] + 'return 1; /* v19 CRC bypass */' + s[j + len('return 0;'):]
+          open(p, 'w').write(s)
+          print('check_version bad_version 分支已改为放行')
+          PY
+          grep -n -A4 "^bad_version:" kernel/module.c
+
       - name: 写入 Docker 配置片段
         run: |
           cat > docker.config <<'EOF'
@@ -282,6 +302,10 @@ jobs:
           CONFIG_IPC_NS=y
           CONFIG_POSIX_MQUEUE=y
           CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          # v19 关键：原厂 MODULE_SIG_FORCE=y，vendor 分区里 35 个 .ko（lcd/rdbg/wlan/音频）
+          # 全部由一加私钥签名；本构建没有该私钥，用构建时随机密钥 → 全部被拒绝加载
+          # → 显示/音频/WiFi 全挂、启动进度无法上报，约 12s 被 RUS 超时看护复位回 fastboot。
+          CONFIG_MODULE_SIG_FORCE=n
           EOF
           echo "--- 片段内容 ---"; cat docker.config
 
@@ -348,7 +372,8 @@ jobs:
             printf '%-32s %s\n' "$k" "$(grep -E "^$k=" out/.config || echo '未开启')"
           done
           grep -q '^CONFIG_PID_NS=y' out/.config || { echo "!! PID_NS 未打开"; exit 1; }
-          grep -q '^CONFIG_MODULE_SIG_FORCE=y' out/.config || { echo "!! 模块签名校验被关，异常"; exit 1; }
+          grep -q '^CONFIG_MODULE_SIG_FORCE=n' out/.config || { echo "!! 模块强制签名未关闭"; exit 1; }
+          grep -q '^CONFIG_MODVERSIONS=y' out/.config || { echo "!! MODVERSIONS 被关（会破坏 vermagic）"; exit 1; }
           grep -q '^CONFIG_LOCALVERSION="-perf"' out/.config || { echo "!! LOCALVERSION 不是 -perf"; exit 1; }
           printf '%-32s %s\n' "CONFIG_LOCALVERSION" "$(grep '^CONFIG_LOCALVERSION=' out/.config)"
 
@@ -396,6 +421,7 @@ jobs:
           name: kebab-kernel-${{ matrix.toolchain }}
           path: |
             src/out/arch/arm64/boot/Image
+            src/out/Module.symvers
             kernel.config
           if-no-files-found: error
           retention-days: 14
