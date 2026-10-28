@@ -106,8 +106,14 @@ jobs:
           grep -q '^CONFIG_PID_NS=y' out/.config || { echo "!! PID_NS 未打开"; exit 1; }
           grep -q '^CONFIG_CGROUP_DEVICE=y' out/.config || { echo "!! CGROUP_DEVICE 未打开"; exit 1; }
           grep -q '^CONFIG_BRIDGE_NETFILTER=y' out/.config || { echo "!! BRIDGE_NETFILTER 未打开"; exit 1; }
-          grep -qE '^(# CONFIG_MODULE_SIG_FORCE is not set|CONFIG_MODULE_SIG_FORCE=n)' out/.config \
-            || { echo "!! 模块强制签名未关闭"; exit 1; }
+          # MODULE_SIG 本身关掉时，MODULE_SIG_FORCE 在 .config 里根本不存在，属正常
+          if grep -q '^CONFIG_MODULE_SIG=y' out/.config; then
+            grep -qE '^(# CONFIG_MODULE_SIG_FORCE is not set|CONFIG_MODULE_SIG_FORCE=n)' out/.config \
+              || { echo "!! 模块强制签名未关闭"; exit 1; }
+            echo "MODULE_SIG 已启用但未强制，OK"
+          else
+            echo "MODULE_SIG 未启用，强制签名天然不存在，OK"
+          fi
 
       - name: 编译内核与模块
         working-directory: kernel
