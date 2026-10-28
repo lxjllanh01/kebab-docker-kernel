@@ -1,0 +1,191 @@
+name: build-kebab-los-docker-kernel
+
+# v30：改走 LineageOS 官方源码树（自洽、全量 oplus 驱动、全模块自建），
+# 目标设备 kebab / OnePlus 8T，对齐官方 nightly 20261023（LOS 24.0）。
+# 内核 commit 取自该构建的 build-manifest.xml：
+#   LineageOS/android_kernel_oneplus_sm8250 @ 98a7970af93b7e01ee77156e7fa0eb7e059a57f0
+# 配置基线按设备 BoardConfigCommon.mk：
+#   TARGET_KERNEL_CONFIG := vendor/kona-perf_defconfig vendor/oplus.config
+# 仅叠加 Docker 需要的命名空间/cgroup/netfilter 开关，并把模块强制签名关掉
+# （LOS 官方模块由其构建密钥签名，我们复现不出，关掉后只 taint 不拒绝）。
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: '内核仓库'
+        required: false
+        default: 'LineageOS/android_kernel_oneplus_sm8250'
+      kernel_commit:
+        description: '内核 commit（须与 LOS 构建清单一致）'
+        required: false
+        default: '98a7970af93b7e01ee77156e7fa0eb7e059a57f0'
+      los_boot_url:
+        description: '对照用 LOS boot.img 地址'
+        required: false
+        default: 'https://mirror.accum.se/mirror/lineageos/full/kebab/20261023/boot.img'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾出磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: 安装工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18 lld-18 llvm-18 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            make bc bison flex libssl-dev libelf-dev python3 \
+            device-tree-compiler cpio rsync kmod zip
+          echo /usr/lib/llvm-18/bin >> "$GITHUB_PATH"
+          clang --version | head -1
+          ld.lld --version | head -1
+
+      - name: 拉取 LOS 内核源码（锁定 commit）
+        run: |
+          git init kernel
+          git -C kernel remote add origin "https://github.com/${{ inputs.kernel_repo }}.git"
+          git -C kernel fetch --depth=1 origin "${{ inputs.kernel_commit }}"
+          git -C kernel checkout --detach FETCH_HEAD
+          cd kernel
+          echo "== HEAD =="; git rev-parse HEAD
+          echo "== 版本 =="; grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
+          echo "== 悬空符号链接 =="; find . -xtype l | wc -l
+          for d in drivers/soc/oplus techpack/display techpack/camera kernel/sched_assist; do
+            printf '  %-22s %s 个文件\n' "$d" "$(find $d -type f 2>/dev/null | wc -l)"
+          done
+
+      - name: 写入 Docker 配置片段
+        run: |
+          cat > docker.config <<'EOF'
+          # Docker 必需（LOS 基线里 PID_NS 是关的）
+          CONFIG_PID_NS=y
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_CGROUP_PIDS=y
+          CONFIG_BRIDGE_NETFILTER=y
+          CONFIG_IPC_NS=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          CONFIG_VETH=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_BRIDGE=y
+          # LOS 官方模块由其构建密钥签名，我们复现不出；关掉强制校验（只 taint 不拒绝）
+          # CONFIG_MODULE_SIG_FORCE is not set
+          EOF
+          cat docker.config
+
+      - name: 生成配置（defconfig + oplus 片段 + docker 片段）
+        working-directory: kernel
+        env:
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+        run: |
+          MAKEFLAGS_CC="CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 DTC_EXT=/usr/bin/dtc \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          echo "MAKEFLAGS_CC=$MAKEFLAGS_CC"
+          make O=out $MAKEFLAGS_CC vendor/kona-perf_defconfig
+          ./scripts/kconfig/merge_config.sh -m -O out out/.config \
+            arch/arm64/configs/vendor/oplus.config "$GITHUB_WORKSPACE/docker.config"
+          make O=out $MAKEFLAGS_CC olddefconfig
+          echo "===== 关键项 ====="
+          for k in CONFIG_PID_NS CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PIDS CONFIG_BRIDGE_NETFILTER \
+                   CONFIG_IPC_NS CONFIG_VETH CONFIG_OVERLAY_FS CONFIG_MEMCG CONFIG_BRIDGE \
+                   CONFIG_MODVERSIONS CONFIG_MODULE_SIG CONFIG_MODULE_SIG_FORCE \
+                   CONFIG_SPECTRA_CAMERA CONFIG_LOCALVERSION CONFIG_PREEMPT CONFIG_SMP; do
+            printf '%-34s %s\n' "$k" "$(grep -E "^$k=|^# $k is not set" out/.config | head -1)"
+          done
+          grep -q '^CONFIG_PID_NS=y' out/.config || { echo "!! PID_NS 未打开"; exit 1; }
+          grep -q '^CONFIG_CGROUP_DEVICE=y' out/.config || { echo "!! CGROUP_DEVICE 未打开"; exit 1; }
+          grep -q '^CONFIG_BRIDGE_NETFILTER=y' out/.config || { echo "!! BRIDGE_NETFILTER 未打开"; exit 1; }
+          grep -qE '^(# CONFIG_MODULE_SIG_FORCE is not set|CONFIG_MODULE_SIG_FORCE=n)' out/.config \
+            || { echo "!! 模块强制签名未关闭"; exit 1; }
+
+      - name: 编译内核与模块
+        working-directory: kernel
+        env:
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+        run: |
+          set -o pipefail
+          MAKEFLAGS_CC="CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 DTC_EXT=/usr/bin/dtc \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make -j"$(nproc)" O=out $MAKEFLAGS_CC Image 2>&1 | tee ../kernel-build.log
+          make -j"$(nproc)" O=out $MAKEFLAGS_CC modules 2>&1 | tee ../modules-build.log
+          ls -la out/arch/arm64/boot/Image
+
+      - name: 打包 boot.img（保留 LOS 原 ramdisk/DTB/头）
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          curl -sL --fail -o stock-los-boot.img "${{ inputs.los_boot_url }}"
+          python3 - <<'PY'
+          import hashlib, struct, sys
+          src = 'stock-los-boot.img'
+          d = open(src, 'rb').read()
+          assert d[:8] == b'ANDROID!', 'boot.img 魔数不对'
+          print('LOS boot.img', len(d), '字节')
+          u32 = lambda o: struct.unpack_from('<I', d, o)[0]
+          u64 = lambda o: struct.unpack_from('<Q', d, o)[0]
+          ksize = u32(0x08); rsize = u32(0x10); ssize = u32(0x18)
+          page = u32(0x24); hv = u32(0x28)
+          dtbo_size = u32(0x648); dtb_size = u32(0x658)
+          print(f'kernel={ksize} ramdisk={rsize} second={ssize} dtbo={dtbo_size} dtb={dtb_size} page={page} v{hv}')
+          def align(x, a): return (x + a - 1) // a * a
+          k_off = page                       # v0/v1/v2 头部占 1 页
+          r_off = align(k_off + ksize, page)
+          s_off = align(r_off + rsize, page)
+          dtbo_off = align(s_off + ssize, page)
+          dtb_off = align(dtbo_off + dtbo_size, page)
+          assert d[k_off+0x38:k_off+0x3C] == b'ARM\x64', '内核段偏移解析错误'
+          img = open('kernel/out/arch/arm64/boot/Image', 'rb').read()
+          print('新内核', len(img), '字节')
+          if len(img) > ksize:
+              print(f'!! 新内核比 LOS 内核区大 {len(img)-ksize} 字节，需要重排布局')
+              sys.exit(2)
+          out = bytearray(d)
+          out[k_off:k_off+ksize] = img + b'\x00'*(ksize-len(img))
+          h = hashlib.sha1()
+          for blob in (bytes(out[k_off:k_off+ksize]),
+                       bytes(out[r_off:r_off+rsize]) if rsize else b'',
+                       bytes(out[s_off:s_off+ssize]) if ssize else b''):
+              h.update(blob); h.update(struct.pack('<I', len(blob)))
+          if dtbo_size:
+              blob = bytes(out[dtbo_off:dtbo_off+dtbo_size]); h.update(blob); h.update(struct.pack('<I', len(blob)))
+          if dtb_size:
+              blob = bytes(out[dtb_off:dtb_off+dtb_size]); h.update(blob); h.update(struct.pack('<I', len(blob)))
+          out[0x240:0x248] = h.digest()[:8]   # id 只有 8 字节，写 20 字节会顶移后续数据
+          diff = [i for i in range(0, len(out), page)
+                  if bytes(out[i:i+page]) != d[i:i+page]
+                  and not (k_off <= i < k_off + ksize) and i != 0]
+          print('内核区外改动页数:', len(diff))
+          assert not diff, f'内核区外被改动 {diff[:5]}'
+          open('artifacts/boot-kebab-los-docker.img','wb').write(bytes(out))
+          print('已生成 boot-kebab-los-docker.img', len(out), '字节, id', h.hexdigest()[:16])
+          cp kernel/out/arch/arm64/boot/Image artifacts/Image
+          cp kernel/out/.config artifacts/kernel.config
+          cp kernel/out/Module.symvers artifacts/Module.symvers || true
+          ( cd kernel/out && find . -name '*.ko' -print0 | tar --null -czf "$GITHUB_WORKSPACE/artifacts/modules.tar.gz" -T - ) || true
+          ls -la artifacts/
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kebab-los-docker
+          path: |
+            artifacts/
+            kernel-build.log
+            modules-build.log
+          if-no-files-found: warn
+          retention-days: 14
