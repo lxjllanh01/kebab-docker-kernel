@@ -22,7 +22,16 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # clang12：贴近原厂工具链（原厂 = clang 10.0.7 + GNU ld 2.27）
+        # gcc11  ：已验证可以完整编译通过的路径，作为对照/回退
+        toolchain: [clang12, gcc11]
+
     steps:
+      - uses: actions/checkout@v4
+
       - name: 腾出磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -300,10 +309,18 @@ jobs:
           # 有 85 项差异，其中 CC_IS_GCC=y 与实际 clang 编译不符），改用从设备
           # /proc/config.gz 提取的原厂配置 stock.config 作基线，保证除 Docker 项外
           # 与出厂内核逐项一致。
+          # 编译器必须走 make 命令行：本树顶层 Makefile 用 `CC = $(CROSS_COMPILE)gcc`
+          # 硬赋值，环境变量会被 makefile 覆盖（这就是 v15 实际用 gcc 11.4 的原因）。
+          if [ "${{ matrix.toolchain }}" = "clang12" ]; then
+            MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- LD=aarch64-linux-gnu-ld"
+          else
+            MAKECC="CC=aarch64-linux-gnu-gcc"
+          fi
+          echo "toolchain=${{ matrix.toolchain }}  MAKECC=$MAKECC"
           mkdir -p out
-          cp ../stock.config out/.config
-          cat ../docker.config >> out/.config
-          make O=out $FEATURE_VARS olddefconfig
+          cp "$GITHUB_WORKSPACE/stock.config" out/.config
+          cat "$GITHUB_WORKSPACE/docker.config" >> out/.config
+          make O=out $FEATURE_VARS $MAKECC olddefconfig
           echo "===== 与原厂配置的差异项 ====="
           python3 - <<'PY'
           import re
@@ -352,8 +369,14 @@ jobs:
             OPLUS_FEATURE_PADL_STATISTICS=yes
             OPLUS_FEATURE_WIFI_ROUTERBOOST=yes
         run: |
-          make O=out $FEATURE_VARS -j"$(nproc)" Image
+          if [ "${{ matrix.toolchain }}" = "clang12" ]; then
+            MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- LD=aarch64-linux-gnu-ld"
+          else
+            MAKECC="CC=aarch64-linux-gnu-gcc"
+          fi
+          make O=out $FEATURE_VARS $MAKECC -j"$(nproc)" Image
           ls -la out/arch/arm64/boot/Image
+          grep -E '^CONFIG_CC_IS_(CLANG|GCC)=|^CONFIG_CLANG_VERSION=|^CONFIG_GCC_VERSION=' out/.config
 
       - name: 校验产物
         working-directory: src
@@ -368,7 +391,7 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: kebab-kernel-image
+          name: kebab-kernel-${{ matrix.toolchain }}
           path: |
             src/out/arch/arm64/boot/Image
             kernel.config
