@@ -27,7 +27,7 @@ jobs:
       matrix:
         # clang12：贴近原厂工具链（原厂 = clang 10.0.7 + GNU ld 2.27）
         # gcc11  ：已验证可以完整编译通过的路径，作为对照/回退
-        toolchain: [clang12, gcc11]
+        toolchain: [clang12lld, gcc11]
 
     steps:
       - uses: actions/checkout@v4
@@ -44,8 +44,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
             python3 python-is-python3 git rsync cpio kmod zip unzip \
-            gcc-aarch64-linux-gnu clang-12 lld-12
+            gcc-aarch64-linux-gnu clang-12 lld-12 llvm-12
           clang-12 --version | head -1
+          ld.lld-12 --version | head -1
+          llvm-ar-12 --version | head -1
 
       - name: 拉取官方基线源码
         run: |
@@ -311,8 +313,8 @@ jobs:
           # 与出厂内核逐项一致。
           # 编译器必须走 make 命令行：本树顶层 Makefile 用 `CC = $(CROSS_COMPILE)gcc`
           # 硬赋值，环境变量会被 makefile 覆盖（这就是 v15 实际用 gcc 11.4 的原因）。
-          if [ "${{ matrix.toolchain }}" = "clang12" ]; then
-            MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- LD=aarch64-linux-gnu-ld"
+          if [ "${{ matrix.toolchain }}" != "gcc11" ]; then
+            MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- LD=ld.lld-12 AR=llvm-ar-12 NM=llvm-nm-12 OBJCOPY=llvm-objcopy-12 OBJDUMP=llvm-objdump-12 STRIP=llvm-strip-12 READELF=llvm-readelf-12"
           else
             MAKECC="CC=aarch64-linux-gnu-gcc"
           fi
@@ -369,8 +371,8 @@ jobs:
             OPLUS_FEATURE_PADL_STATISTICS=yes
             OPLUS_FEATURE_WIFI_ROUTERBOOST=yes
         run: |
-          if [ "${{ matrix.toolchain }}" = "clang12" ]; then
-            MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- LD=aarch64-linux-gnu-ld"
+          if [ "${{ matrix.toolchain }}" != "gcc11" ]; then
+            MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- LD=ld.lld-12 AR=llvm-ar-12 NM=llvm-nm-12 OBJCOPY=llvm-objcopy-12 OBJDUMP=llvm-objdump-12 STRIP=llvm-strip-12 READELF=llvm-readelf-12"
           else
             MAKECC="CC=aarch64-linux-gnu-gcc"
           fi
