@@ -130,59 +130,82 @@ jobs:
           make -j"$(nproc)" O=out $MAKEFLAGS_CC modules 2>&1 | tee ../modules-build.log
           ls -la out/arch/arm64/boot/Image
 
-      - name: 打包 boot.img（保留 LOS 原 ramdisk/DTB/头）
+      - name: 打包 boot.img（支持内核变大，重建布局）
         run: |
           set -o pipefail
           mkdir -p artifacts
-          curl -sL --fail -o stock-los-boot.img "${{ inputs.los_boot_url }}"
-          python3 - <<'PY'
-          import hashlib, struct, sys
-          src = 'stock-los-boot.img'
-          d = open(src, 'rb').read()
-          assert d[:8] == b'ANDROID!', 'boot.img 魔数不对'
-          print('LOS boot.img', len(d), '字节')
-          u32 = lambda o: struct.unpack_from('<I', d, o)[0]
-          u64 = lambda o: struct.unpack_from('<Q', d, o)[0]
-          ksize = u32(0x08); rsize = u32(0x10); ssize = u32(0x18)
-          page = u32(0x24); hv = u32(0x28)
-          dtbo_size = u32(0x648); dtb_size = u32(0x658)
-          print(f'kernel={ksize} ramdisk={rsize} second={ssize} dtbo={dtbo_size} dtb={dtb_size} page={page} v{hv}')
-          def align(x, a): return (x + a - 1) // a * a
-          k_off = page                       # v0/v1/v2 头部占 1 页
-          r_off = align(k_off + ksize, page)
-          s_off = align(r_off + rsize, page)
-          dtbo_off = align(s_off + ssize, page)
-          dtb_off = align(dtbo_off + dtbo_size, page)
-          assert d[k_off+0x38:k_off+0x3C] == b'ARM\x64', '内核段偏移解析错误'
-          img = open('kernel/out/arch/arm64/boot/Image', 'rb').read()
-          print('新内核', len(img), '字节')
-          if len(img) > ksize:
-              print(f'!! 新内核比 LOS 内核区大 {len(img)-ksize} 字节，需要重排布局')
-              sys.exit(2)
-          out = bytearray(d)
-          out[k_off:k_off+ksize] = img + b'\x00'*(ksize-len(img))
-          h = hashlib.sha1()
-          for blob in (bytes(out[k_off:k_off+ksize]),
-                       bytes(out[r_off:r_off+rsize]) if rsize else b'',
-                       bytes(out[s_off:s_off+ssize]) if ssize else b''):
-              h.update(blob); h.update(struct.pack('<I', len(blob)))
-          if dtbo_size:
-              blob = bytes(out[dtbo_off:dtbo_off+dtbo_size]); h.update(blob); h.update(struct.pack('<I', len(blob)))
-          if dtb_size:
-              blob = bytes(out[dtb_off:dtb_off+dtb_size]); h.update(blob); h.update(struct.pack('<I', len(blob)))
-          out[0x240:0x248] = h.digest()[:8]   # id 只有 8 字节，写 20 字节会顶移后续数据
-          diff = [i for i in range(0, len(out), page)
-                  if bytes(out[i:i+page]) != d[i:i+page]
-                  and not (k_off <= i < k_off + ksize) and i != 0]
-          print('内核区外改动页数:', len(diff))
-          assert not diff, f'内核区外被改动 {diff[:5]}'
-          open('artifacts/boot-kebab-los-docker.img','wb').write(bytes(out))
-          print('已生成 boot-kebab-los-docker.img', len(out), '字节, id', h.hexdigest()[:16])
-          PY
           cp kernel/out/arch/arm64/boot/Image artifacts/Image
           cp kernel/out/.config artifacts/kernel.config
           cp kernel/out/Module.symvers artifacts/Module.symvers || true
           ( cd kernel/out && find . -name '*.ko' -print0 | tar --null -czf "$GITHUB_WORKSPACE/artifacts/modules.tar.gz" -T - ) || true
+          curl -sL --fail -o stock-los-boot.img "${{ inputs.los_boot_url }}"
+          python3 - <<'PY'
+          import hashlib, struct, sys
+          d = open('stock-los-boot.img', 'rb').read()
+          assert d[:8] == b'ANDROID!', 'boot.img 魔数不对'
+          u32 = lambda o: struct.unpack_from('<I', d, o)[0]
+          u64 = lambda o: struct.unpack_from('<Q', d, o)[0]
+          page = u32(0x24)
+          hdr = u32(0x66C) or page
+          ksize, rsize, ssize = u32(0x08), u32(0x10), u32(0x18)
+          rd_size, dtb_size = u32(0x660), u32(0x670)
+          def align(x, a=page): return (x + a - 1) // a * a
+          k_off = align(hdr)
+          r_off = align(k_off + ksize)
+          s_off = align(r_off + rsize)
+          rd_off = align(s_off + ssize)
+          dtb_off = align(rd_off + rd_size)
+          assert d[k_off+0x38:k_off+0x3C] == b'ARM\x64', '内核段偏移解析错误'
+          print(f'LOS boot.img {len(d)} 字节 page={page} hdr={hdr}')
+          print(f'原布局 kernel={ksize} ramdisk={rsize} dtbo={rd_size} dtb={dtb_size}')
+          kernel = open('kernel/out/arch/arm64/boot/Image', 'rb').read()
+          print(f'新内核 {len(kernel)} 字节（比原内核区 {len(kernel)-ksize:+d}）')
+          ramdisk = d[r_off:r_off+rsize]
+          second  = d[s_off:s_off+ssize]
+          dtbo    = d[rd_off:rd_off+rd_size]
+          dtb     = d[dtb_off:dtb_off+dtb_size]
+          foot = d[-64:]
+          vbmeta = b''
+          if foot[:4] == b'AVBf':
+              orig, vbo, vbs = struct.unpack_from('>QQQ', foot, 12)
+              assert vbo + vbs <= len(d) - 64, 'vbmeta 位置异常'
+              vbmeta = d[vbo:vbo+vbs]
+              print(f'AVB footer vbmeta@{vbo} size={vbs}')
+          else:
+              print('!! 未找到 AVB footer，按无 footer 处理')
+          out = bytearray(len(d))
+          out[0:page] = d[0:page]
+          pos = align(hdr)
+          nk = pos; out[pos:pos+len(kernel)] = kernel; pos = align(pos+len(kernel))
+          nr = pos; out[pos:pos+len(ramdisk)] = ramdisk; pos = align(pos+len(ramdisk))
+          ns = pos; out[pos:pos+len(second)] = second; pos = align(pos+len(second))
+          nd = pos; out[pos:pos+len(dtbo)] = dtbo; pos = align(pos+len(dtbo))
+          nb = pos; out[pos:pos+len(dtb)] = dtb; pos = align(pos+len(dtb))
+          data_end = pos
+          vbo_new = align(data_end)
+          if vbmeta:
+              assert vbo_new + len(vbmeta) + 64 <= len(d), '数据区过大，vbmeta/footer 放不下'
+              out[vbo_new:vbo_new+len(vbmeta)] = vbmeta
+              nf = bytearray(foot)
+              struct.pack_into('>Q', nf, 12, vbo_new)
+              struct.pack_into('>Q', nf, 20, vbo_new)
+              struct.pack_into('>Q', nf, 28, len(vbmeta))
+              out[-64:] = bytes(nf)
+          struct.pack_into('<I', out, 0x08, len(kernel))
+          sha = hashlib.sha1()
+          for blob in (kernel, ramdisk, second, dtbo, dtb):
+              sha.update(blob); sha.update(struct.pack('<I', len(blob)))
+          out[0x240:0x254] = sha.digest()
+          out[0x254:0x260] = b'\x00' * 12
+          open('artifacts/boot-kebab-los-docker.img','wb').write(bytes(out))
+          chk = open('artifacts/boot-kebab-los-docker.img','rb').read()
+          assert chk[nk+0x38:nk+0x3C] == b'ARM\x64', '内核 ARM64 magic 不对'
+          assert chk[nr:nr+len(ramdisk)] == ramdisk, 'ramdisk 不一致'
+          assert chk[nb:nb+8] == dtb[:8], 'dtb 不一致'
+          if vbmeta: assert chk[-64:-60] == b'AVBf', 'footer 不在末尾'
+          print(f'新布局 kernel@{nk} ramdisk@{nr} dtbo@{nd} dtb@{nb} data_end={data_end} vbmeta@{vbo_new}')
+          print('打包完成', len(chk), '字节')
+          PY
           ls -la artifacts/
 
       - name: 上传产物
