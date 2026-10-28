@@ -296,9 +296,31 @@ jobs:
             OPLUS_FEATURE_PADL_STATISTICS=yes
             OPLUS_FEATURE_WIFI_ROUTERBOOST=yes
         run: |
-          make O=out $FEATURE_VARS vendor/kona-perf_defconfig
+          # v16 关键变更：不再用 vendor/kona-perf_defconfig 作基线（它与设备出厂配置
+          # 有 85 项差异，其中 CC_IS_GCC=y 与实际 clang 编译不符），改用从设备
+          # /proc/config.gz 提取的原厂配置 stock.config 作基线，保证除 Docker 项外
+          # 与出厂内核逐项一致。
+          mkdir -p out
+          cp ../stock.config out/.config
           cat ../docker.config >> out/.config
-          make O=out olddefconfig
+          make O=out $FEATURE_VARS olddefconfig
+          echo "===== 与原厂配置的差异项 ====="
+          python3 - <<'PY'
+          import re
+          def parse(p):
+              d = {}
+              for line in open(p, encoding='utf-8', errors='replace'):
+                  line = line.strip()
+                  m = re.match(r'^(CONFIG_\w+)=(.*)$', line)
+                  if m: d[m.group(1)] = m.group(2)
+                  m = re.match(r'^# (CONFIG_\w+) is not set$', line)
+                  if m: d[m.group(1)] = 'n'
+              return d
+          old = parse('../stock.config'); new = parse('out/.config')
+          diff = [(k, old.get(k,'缺'), new.get(k,'缺')) for k in sorted(set(old)|set(new)) if old.get(k,'缺') != new.get(k,'缺')]
+          print('差异 %d 项:' % len(diff))
+          for k,o,n in diff: print('  %s: %s -> %s' % (k,o,n))
+          PY
           echo "===== 关键项核对 ====="
           for k in CONFIG_PID_NS CONFIG_CGROUP_DEVICE CONFIG_BRIDGE_NETFILTER \
                    CONFIG_CGROUP_PIDS CONFIG_IPC_NS CONFIG_POSIX_MQUEUE \
