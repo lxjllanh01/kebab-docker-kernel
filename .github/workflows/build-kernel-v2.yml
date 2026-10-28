@@ -1,0 +1,163 @@
+name: build-kebab-docker-kernel-v2
+
+# v20 策略：不再用 OnePlusOSS 的"残缺树 + 4.19.325 补丁"缝合，
+# 直接以 toraidl/android_kernel_oneplus_sm8250（完整树，含 drivers/soc/oplus、
+# kernel/sched_assist、techpack/display，版本自洽）为基座，
+# 只叠加 Docker 需要的配置项，并用设备出厂配置 stock.config 作基线。
+on:
+  workflow_dispatch:
+    inputs:
+      base_repo:
+        description: '基座仓库'
+        required: false
+        default: 'toraidl/android_kernel_oneplus_sm8250'
+      base_branch:
+        description: '基座分支'
+        required: false
+        default: 'bpf-5.15-backport'
+      use_stock_config:
+        description: '用设备出厂配置作基线（true/false）'
+        required: false
+        default: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾出磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc bison flex libssl-dev \
+            libelf-dev kmod cpio rsync python3 gcc-aarch64-linux-gnu \
+            clang-12 lld-12 llvm-12
+          clang-12 --version | head -1
+          ld.lld-12 --version | head -1
+
+      - name: 拉取基座源码
+        run: |
+          git clone --depth=1 -b "${{ inputs.base_branch }}" \
+            "https://github.com/${{ inputs.base_repo }}.git" src
+          cd src
+          echo "== 版本 =="; grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
+          echo "== 关键目录 =="
+          for d in drivers/soc/oplus kernel/sched_assist techpack/display \
+                   kernel/tuning kernel/uad; do
+            printf '  %-24s %s 个文件\n' "$d" "$(find $d -type f 2>/dev/null | wc -l)"
+          done
+          echo "== 悬空符号链接 =="; find . -xtype l | wc -l
+
+      - name: 放宽模块符号版本校验（vendor .ko 可加载）
+        working-directory: src
+        run: |
+          # vendor 分区的 .ko 由一加私钥签名、CRC 按 4.19.157 记录；本树为 4.19.325，
+          # 关掉强制签名（见 docker.config 的 CONFIG_MODULE_SIG_FORCE=n）后还需放过
+          # CRC 不一致的情况，否则模块会以 "disagrees about version of symbol" 被拒。
+          python3 - <<'PY'
+          p = 'kernel/module.c'
+          s = open(p).read()
+          assert 'v20 CRC' not in s, '已打过补丁'
+          i = s.index('bad_version:')
+          j = s.index('return 0;', i)
+          s = s[:j] + 'return 1; /* v20 CRC bypass */' + s[j + len('return 0;'):]
+          open(p, 'w').write(s)
+          print('check_version bad_version 已改为放行')
+          PY
+          grep -n -A4 "^bad_version:" kernel/module.c
+
+      - name: 写入配置片段
+        run: |
+          cat > docker.config <<'EOF'
+          # Docker 必需
+          CONFIG_PID_NS=y
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_BRIDGE_NETFILTER=y
+          CONFIG_CGROUP_PIDS=y
+          CONFIG_IPC_NS=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          # vendor 模块加载（一加私钥签名，本构建无法复现）
+          CONFIG_MODULE_SIG_FORCE=n
+          EOF
+          cat docker.config
+
+      - name: 生成配置
+        working-directory: src
+        env:
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+        run: |
+          MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- \
+            LD=ld.lld-12 AR=llvm-ar-12 NM=llvm-nm-12 OBJCOPY=llvm-objcopy-12 \
+            OBJDUMP=llvm-objdump-12 STRIP=llvm-strip-12 READELF=llvm-readelf-12"
+          echo "MAKECC=$MAKECC"
+          mkdir -p out
+          if [ "${{ inputs.use_stock_config }}" = "true" ] && [ -f "$GITHUB_WORKSPACE/stock.config" ]; then
+            echo "== 用设备出厂配置作基线 =="
+            cp "$GITHUB_WORKSPACE/stock.config" out/.config
+          else
+            echo "== 用基座自带的 kona-perf_defconfig =="
+            make O=out $MAKECC vendor/kona-perf_defconfig
+          fi
+          cat "$GITHUB_WORKSPACE/docker.config" >> out/.config
+          make O=out $MAKECC olddefconfig
+          echo "===== 关键项 ====="
+          for k in CONFIG_PID_NS CONFIG_CGROUP_DEVICE CONFIG_BRIDGE_NETFILTER \
+                   CONFIG_CGROUP_PIDS CONFIG_IPC_NS CONFIG_POSIX_MQUEUE \
+                   CONFIG_OVERLAY_FS CONFIG_VETH CONFIG_MEMCG CONFIG_MODVERSIONS \
+                   CONFIG_MODULE_SIG_FORCE CONFIG_LOCALVERSION CONFIG_PREEMPT CONFIG_SMP; do
+            printf '%-34s %s\n' "$k" "$(grep -E "^$k=|^# $k is not set" out/.config | head -1)"
+          done
+          grep -q '^CONFIG_PID_NS=y' out/.config || { echo "!! PID_NS 未打开"; exit 1; }
+          grep -q '^CONFIG_CGROUP_DEVICE=y' out/.config || { echo "!! CGROUP_DEVICE 未打开"; exit 1; }
+          grep -q '^CONFIG_BRIDGE_NETFILTER=y' out/.config || { echo "!! BRIDGE_NETFILTER 未打开"; exit 1; }
+          grep -qE '^(# CONFIG_MODULE_SIG_FORCE is not set|CONFIG_MODULE_SIG_FORCE=n)' out/.config \
+            || { echo "!! 模块强制签名未关闭"; exit 1; }
+
+      - name: 编译内核
+        working-directory: src
+        env:
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+        run: |
+          MAKECC="CC=clang-12 REAL_CC=clang-12 CLANG_TRIPLE=aarch64-linux-gnu- \
+            LD=ld.lld-12 AR=llvm-ar-12 NM=llvm-nm-12 OBJCOPY=llvm-objcopy-12 \
+            OBJDUMP=llvm-objdump-12 STRIP=llvm-strip-12 READELF=llvm-readelf-12"
+          make O=out $MAKECC -j"$(nproc)" Image
+          ls -la out/arch/arm64/boot/Image
+
+      - name: 校验产物
+        working-directory: src
+        run: |
+          cp out/.config "$GITHUB_WORKSPACE/kernel.config"
+          ls -la "$GITHUB_WORKSPACE/kernel.config"
+          python3 - <<'PY'
+          import struct, os
+          p = 'out/arch/arm64/boot/Image'
+          d = open(p, 'rb').read()
+          print('大小', len(d), 'magic', d[0x38:0x3c])
+          assert d[0x38:0x3c] == b'ARMd', '不是合法的 arm64 Image'
+          text_off, image_size, flags = struct.unpack('<QQQ', d[8:0x20])
+          print(f'text_offset=0x{text_off:x} image_size={image_size} flags=0x{flags:x}')
+          i = d.find(b'Linux version')
+          print('版本串:', d[i:i+180].split(b'\x00')[0].decode('utf-8', 'replace'))
+          PY
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kebab-kernel-v2
+          path: |
+            src/out/arch/arm64/boot/Image
+            src/out/Module.symvers
+            kernel.config
+          if-no-files-found: error
+          retention-days: 14
