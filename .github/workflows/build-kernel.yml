@@ -372,7 +372,7 @@ jobs:
             printf '%-32s %s\n' "$k" "$(grep -E "^$k=" out/.config || echo '未开启')"
           done
           grep -q '^CONFIG_PID_NS=y' out/.config || { echo "!! PID_NS 未打开"; exit 1; }
-          grep -q '^CONFIG_MODULE_SIG_FORCE=n' out/.config || { echo "!! 模块强制签名未关闭"; exit 1; }
+          grep -qE '^(# CONFIG_MODULE_SIG_FORCE is not set|CONFIG_MODULE_SIG_FORCE=n)' out/.config || { echo "!! 模块强制签名未关闭"; exit 1; }
           grep -q '^CONFIG_MODVERSIONS=y' out/.config || { echo "!! MODVERSIONS 被关（会破坏 vermagic）"; exit 1; }
           grep -q '^CONFIG_LOCALVERSION="-perf"' out/.config || { echo "!! LOCALVERSION 不是 -perf"; exit 1; }
           printf '%-32s %s\n' "CONFIG_LOCALVERSION" "$(grep '^CONFIG_LOCALVERSION=' out/.config)"
